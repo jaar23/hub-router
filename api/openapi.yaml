@@ -1,0 +1,286 @@
+openapi: "3.1.0"
+info:
+  title: hub-router
+  version: "0.1.0"
+  description: |
+    hub-router is a high-performance middleware that brokers requests between an
+    online web server and a local processing server via an async queue and long-polling.
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+security: []
+
+components:
+  securitySchemes:
+    OnlineAPIKey:
+      type: apiKey
+      in: header
+      name: X-Online-API-Key
+    LocalAPIKey:
+      type: apiKey
+      in: header
+      name: X-Local-API-Key
+    AdminAPIKey:
+      type: apiKey
+      in: header
+      name: X-Admin-API-Key
+
+  schemas:
+    SubmitRequest:
+      type: object
+      required: [payload]
+      properties:
+        payload:
+          description: Any JSON value. Opaque to hub-router.
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          description: Optional metadata forwarded with the request.
+
+    SubmitResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          description: UUIDv7 correlation ID for polling the result.
+        estimated_wait_ms:
+          type: integer
+          description: Rough estimate of processing wait time in milliseconds.
+
+    Result:
+      type: object
+      properties:
+        request_id:
+          type: string
+        payload:
+          description: Any JSON value returned by the local server.
+        status_code:
+          type: integer
+        error:
+          type: string
+        completed_at:
+          type: string
+          format: date-time
+
+    PullResponse:
+      type: object
+      properties:
+        requests:
+          type: array
+          items:
+            $ref: "#/components/schemas/QueuedRequest"
+        count:
+          type: integer
+
+    QueuedRequest:
+      type: object
+      properties:
+        id:
+          type: string
+        payload: {}
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        enqueued_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+        queue_depth:
+          type: integer
+        uptime_seconds:
+          type: integer
+
+    ErrorResponse:
+      type: object
+      properties:
+        code:
+          type: string
+          example: QUEUE_FULL
+        message:
+          type: string
+        request_id:
+          type: string
+
+paths:
+  /request:
+    post:
+      summary: Submit a request
+      description: |
+        Enqueues the request and returns a correlation ID immediately.
+        The online server then polls GET /result/{id} for the result.
+      security:
+        - OnlineAPIKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubmitRequest"
+      responses:
+        "202":
+          description: Accepted — request enqueued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmitResponse"
+        "400":
+          description: Invalid request body
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Queue is full
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /result/{id}:
+    get:
+      summary: Long-poll for a result
+      description: |
+        Blocks until the result for the given request ID is ready or the timeout
+        elapses. On timeout returns 204 — the client should retry with the same ID.
+      security:
+        - OnlineAPIKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: timeout
+          in: query
+          description: Long-poll timeout, e.g. "30s". Capped at server maximum.
+          schema:
+            type: string
+            default: "30s"
+      responses:
+        "200":
+          description: Result ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Result"
+        "204":
+          description: Timeout elapsed — retry with the same ID
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Unknown request ID (expired or never submitted)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /queue/pull:
+    get:
+      summary: Pull a batch of pending requests
+      description: |
+        Returns up to `batch` requests from the queue immediately (never blocks).
+        Returns an empty array when the queue is empty.
+      security:
+        - LocalAPIKey: []
+      parameters:
+        - name: batch
+          in: query
+          schema:
+            type: integer
+            default: 10
+          description: Maximum number of requests to return.
+      responses:
+        "200":
+          description: Batch of pending requests (may be empty)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PullResponse"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /queue/result:
+    post:
+      summary: Push a completed result
+      description: |
+        Stores the result and wakes the long-poll waiter for the given request ID.
+      security:
+        - LocalAPIKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Result"
+      responses:
+        "204":
+          description: Result accepted
+        "400":
+          description: Invalid request body
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Unknown request ID (expired or already delivered)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /health:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      security:
+        - AdminAPIKey: []
+      responses:
+        "200":
+          description: Prometheus text format metrics
+          content:
+            text/plain:
+              schema:
+                type: string
