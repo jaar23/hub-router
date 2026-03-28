@@ -1,11 +1,17 @@
-export { OnlineClient } from "./online.js";
-export { LocalClient } from "./local.js";
+/**
+ * hub-router Node.js SDK.
+ *
+ * For a zero-install single-file version, copy hub-router.ts directly.
+ */
 export {
+  OnlineClient,
+  LocalClient,
   HubRouterError,
   QueueFullError,
   RequestNotFoundError,
   ResultTimeoutError,
-} from "./errors.js";
+} from "./hub-router.js";
+
 export type {
   QueuedRequest,
   Result,
@@ -14,4 +20,4 @@ export type {
   OnlineClientOptions,
   LocalClientOptions,
   ProcessorFn,
-} from "./types.js";
+} from "./hub-router.js";
