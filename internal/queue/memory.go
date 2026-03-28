@@ -61,6 +61,11 @@ func (q *MemoryQueue) Len() int {
 	return len(q.ch)
 }
 
+// Cap returns the maximum capacity of the queue.
+func (q *MemoryQueue) Cap() int {
+	return cap(q.ch)
+}
+
 // Stats returns queue counters for metrics/health endpoints.
 func (q *MemoryQueue) Stats() (enqueued, dequeued, expired, dropped int64) {
 	return q.enqueued.Load(), q.dequeued.Load(), q.expired.Load(), q.dropped.Load()

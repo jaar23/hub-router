@@ -114,6 +114,27 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	})
 }
 
+// RateLimitStats holds a snapshot of rate-limiter state for observability.
+type RateLimitStats struct {
+	TrackedIPs   int // total IPs currently tracked
+	ThrottledIPs int // IPs with < 1 token (currently being rate-limited)
+}
+
+// Stats returns a point-in-time snapshot of rate-limiter activity.
+func (rl *RateLimiter) Stats() RateLimitStats {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	s := RateLimitStats{TrackedIPs: len(rl.buckets)}
+	for _, b := range rl.buckets {
+		b.mu.Lock()
+		if b.tokens < 1 {
+			s.ThrottledIPs++
+		}
+		b.mu.Unlock()
+	}
+	return s
+}
+
 // Close stops the background cleanup goroutine.
 func (rl *RateLimiter) Close() {
 	rl.once.Do(func() { close(rl.stopCh) })

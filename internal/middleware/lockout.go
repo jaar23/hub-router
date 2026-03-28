@@ -186,6 +186,31 @@ func (al *AuthLockout) getOrCreate(ip string) *ipRecord {
 	return rec
 }
 
+// LockoutStats holds a snapshot of auth-lockout state for observability.
+type LockoutStats struct {
+	LockedIPs  int // IPs with an active lockout
+	WatchedIPs int // IPs with ≥1 recorded failure (includes locked)
+}
+
+// Stats returns a point-in-time snapshot of lockout activity.
+func (al *AuthLockout) Stats() LockoutStats {
+	al.mu.Lock()
+	defer al.mu.Unlock()
+	s := LockoutStats{}
+	now := time.Now()
+	for _, rec := range al.records {
+		rec.mu.Lock()
+		if rec.failures > 0 {
+			s.WatchedIPs++
+		}
+		if !rec.lockedAt.IsZero() && now.Sub(rec.lockedAt) < al.lockoutDuration {
+			s.LockedIPs++
+		}
+		rec.mu.Unlock()
+	}
+	return s
+}
+
 // Close stops the background cleanup goroutine.
 func (al *AuthLockout) Close() {
 	al.once.Do(func() { close(al.stopCh) })

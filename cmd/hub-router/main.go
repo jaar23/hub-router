@@ -10,11 +10,24 @@ import (
 
 	"github.com/jaar23/hub-router/internal/config"
 	"github.com/jaar23/hub-router/internal/server"
+	"github.com/jaar23/hub-router/internal/tui"
 )
 
 func main() {
 	healthcheck := flag.Bool("healthcheck", false, "run a one-shot health check against the running server and exit")
+	tuiMode := flag.Bool("tui", false, "run the terminal dashboard (connects to the running server via HTTP)")
 	flag.Parse()
+
+	if *tuiMode {
+		port := envOrDefault("HR_PORT", "8080")
+		addr := fmt.Sprintf("http://127.0.0.1:%s", port)
+		apiKey := os.Getenv("HR_ADMIN_API_KEY")
+		if err := tui.Run(addr, apiKey); err != nil {
+			fmt.Fprintf(os.Stderr, "tui: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 
 	if *healthcheck {
 		port := envOrDefault("HR_PORT", "8080")

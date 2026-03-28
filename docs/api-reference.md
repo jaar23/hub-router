@@ -288,6 +288,43 @@ curl -s -X POST http://localhost:8080/queue/result \
 
 ---
 
+### GET /debug/stats
+
+Returns a detailed real-time snapshot of all observable hub-router state. Used by the built-in terminal dashboard (`-tui` flag) but also queryable directly.
+
+**Headers:** `X-Admin-API-Key: <key>` (only if `HR_ADMIN_API_KEY` is configured)
+
+**Response:**
+
+```json
+{
+  "uptime_seconds": 3600,
+  "queue": {
+    "depth": 5,
+    "capacity": 10000,
+    "enqueued_total": 1234,
+    "dequeued_total": 1190,
+    "expired_total": 3,
+    "dropped_total": 0
+  },
+  "store": {
+    "results": 12,
+    "active_waiters": 4
+  },
+  "security": {
+    "rate_limit_enabled": true,
+    "tracked_ips": 15,
+    "throttled_ips": 2,
+    "locked_ips": 1,
+    "watched_ips": 3
+  }
+}
+```
+
+All counters (`enqueued_total`, `dequeued_total`, etc.) are cumulative since server start. `depth` and `active_waiters` are instantaneous values.
+
+---
+
 ### GET /health
 
 Returns the current health of hub-router. No authentication required (accessible to load balancers and orchestrators).

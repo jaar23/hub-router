@@ -54,3 +54,36 @@ type HealthResponse struct {
 	QueueDepth    int    `json:"queue_depth"`
 	UptimeSeconds int64  `json:"uptime_seconds"`
 }
+
+// StatsResponse is returned by GET /debug/stats — a detailed snapshot for the TUI.
+type StatsResponse struct {
+	UptimeSeconds int64         `json:"uptime_seconds"`
+	Queue         QueueStats    `json:"queue"`
+	Store         StoreStats    `json:"store"`
+	Security      SecurityStats `json:"security"`
+}
+
+// QueueStats holds queue counters for the stats endpoint.
+type QueueStats struct {
+	Depth         int   `json:"depth"`
+	Capacity      int   `json:"capacity"`
+	EnqueuedTotal int64 `json:"enqueued_total"`
+	DequeuedTotal int64 `json:"dequeued_total"`
+	ExpiredTotal  int64 `json:"expired_total"`
+	DroppedTotal  int64 `json:"dropped_total"`
+}
+
+// StoreStats holds result-store counters for the stats endpoint.
+type StoreStats struct {
+	Results       int `json:"results"`
+	ActiveWaiters int `json:"active_waiters"`
+}
+
+// SecurityStats holds rate-limiter and lockout counters for the stats endpoint.
+type SecurityStats struct {
+	RateLimitEnabled bool `json:"rate_limit_enabled"`
+	TrackedIPs       int  `json:"tracked_ips"`
+	ThrottledIPs     int  `json:"throttled_ips"`
+	LockedIPs        int  `json:"locked_ips"`
+	WatchedIPs       int  `json:"watched_ips"`
+}

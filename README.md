@@ -146,6 +146,7 @@ worker.run(async (req) => {
 | [SDK — Node.js](docs/sdk-node.md) | TypeScript/JavaScript client |
 | [Deployment](docs/deployment.md) | Docker, docker-compose, production checklist |
 | [Security](docs/security.md) | Rate limiting, lockout, hardening details |
+| [Observability](docs/observability.md) | Terminal dashboard, stats endpoint, Prometheus metrics |
 
 The raw HTTP API is also described in [`api/openapi.yaml`](api/openapi.yaml).
 

@@ -62,7 +62,7 @@ func New(cfg *config.Config, logger *slog.Logger) *Server {
 
 	onlineH := handler.NewOnlineHandler(q, s, cfg)
 	localH := handler.NewLocalHandler(q, s, cfg)
-	adminH := handler.NewAdminHandler(q, s)
+	adminH := handler.NewAdminHandler(q, s, rl, lockout)
 
 	mux := http.NewServeMux()
 
@@ -90,6 +90,8 @@ func New(cfg *config.Config, logger *slog.Logger) *Server {
 		auth.AdminAuth(http.HandlerFunc(adminH.HandleHealth)))
 	mux.Handle("GET /metrics",
 		auth.AdminAuth(adminH.HandleMetrics()))
+	mux.Handle("GET /debug/stats",
+		auth.AdminAuth(http.HandlerFunc(adminH.HandleStats)))
 
 	// Global middleware chain (outermost → innermost):
 	//   SecureHeaders → RateLimit → BodyLimit → Recovery → Logging → mux
