@@ -18,11 +18,13 @@ import (
 
 // Server wires together the HTTP server, handlers, and middleware.
 type Server struct {
-	cfg    *config.Config
-	logger *slog.Logger
-	q      *queue.MemoryQueue
-	s      *store.MemoryStore
-	http   *http.Server
+	cfg     *config.Config
+	logger  *slog.Logger
+	q       *queue.MemoryQueue
+	s       *store.MemoryStore
+	rl      *middleware.RateLimiter
+	lockout *middleware.AuthLockout
+	http    *http.Server
 }
 
 // New creates a Server from configuration.
@@ -32,34 +34,70 @@ func New(cfg *config.Config, logger *slog.Logger) *Server {
 
 	auth := middleware.NewAPIKeyMiddleware(cfg.Auth.OnlineAPIKeys, cfg.Auth.LocalAPIKeys, cfg.Auth.AdminAPIKey)
 
+	// Per-IP rate limiter (token bucket). Disabled when RateLimitRPS == 0.
+	var rl *middleware.RateLimiter
+	if cfg.Security.RateLimitRPS > 0 {
+		rl = middleware.NewRateLimiter(
+			cfg.Security.RateLimitRPS,
+			cfg.Security.RateLimitBurst,
+			cfg.Security.LockoutWindow,
+		)
+		logger.Info("rate limiting enabled",
+			"rps", cfg.Security.RateLimitRPS,
+			"burst", cfg.Security.RateLimitBurst,
+		)
+	}
+
+	// Per-IP auth failure lockout.
+	lockout := middleware.NewAuthLockout(
+		cfg.Security.LockoutThreshold,
+		cfg.Security.LockoutDuration,
+		cfg.Security.LockoutWindow,
+		logger,
+	)
+	logger.Info("auth lockout enabled",
+		"threshold", cfg.Security.LockoutThreshold,
+		"duration", cfg.Security.LockoutDuration,
+	)
+
 	onlineH := handler.NewOnlineHandler(q, s, cfg)
 	localH := handler.NewLocalHandler(q, s, cfg)
 	adminH := handler.NewAdminHandler(q, s)
 
 	mux := http.NewServeMux()
 
-	// Online server routes
+	// Online server routes — lockout wraps the auth check so failures are tracked.
 	mux.Handle("POST /request",
-		auth.OnlineAuth(http.HandlerFunc(onlineH.HandleSubmit)))
+		lockout.Wrap("X-Online-API-Key", auth.ValidOnlineKey,
+			http.HandlerFunc(onlineH.HandleSubmit)))
 	mux.Handle("GET /result/{id}",
-		auth.OnlineAuth(http.HandlerFunc(onlineH.HandleResult)))
+		lockout.Wrap("X-Online-API-Key", auth.ValidOnlineKey,
+			http.HandlerFunc(onlineH.HandleResult)))
 
-	// Local server routes
+	// Local server routes — lockout wraps the auth check.
 	mux.Handle("GET /queue/pull",
-		auth.LocalAuth(http.HandlerFunc(localH.HandlePull)))
+		lockout.Wrap("X-Local-API-Key", auth.ValidLocalKey,
+			http.HandlerFunc(localH.HandlePull)))
 	mux.Handle("POST /queue/result",
-		auth.LocalAuth(http.HandlerFunc(localH.HandleResult)))
+		lockout.Wrap("X-Local-API-Key", auth.ValidLocalKey,
+			http.HandlerFunc(localH.HandleResult)))
 
-	// Admin routes (optional auth)
+	// Admin routes (optional auth — lockout not applied, admin key is single).
 	mux.Handle("GET /health",
 		auth.AdminAuth(http.HandlerFunc(adminH.HandleHealth)))
 	mux.Handle("GET /metrics",
 		auth.AdminAuth(adminH.HandleMetrics()))
 
-	// Apply global middleware: Recovery → Logging → router
+	// Global middleware chain (outermost → innermost):
+	//   SecureHeaders → RateLimit → BodyLimit → Recovery → Logging → mux
 	var h http.Handler = mux
 	h = middleware.Logging(logger)(h)
 	h = middleware.Recovery(logger)(h)
+	h = middleware.BodyLimit(cfg.Security.MaxBodyBytes)(h)
+	if rl != nil {
+		h = rl.Middleware(h)
+	}
+	h = middleware.SecureHeaders(h)
 
 	httpSrv := &http.Server{
 		Addr:         cfg.Addr(),
@@ -69,11 +107,13 @@ func New(cfg *config.Config, logger *slog.Logger) *Server {
 	}
 
 	return &Server{
-		cfg:    cfg,
-		logger: logger,
-		q:      q,
-		s:      s,
-		http:   httpSrv,
+		cfg:     cfg,
+		logger:  logger,
+		q:       q,
+		s:       s,
+		rl:      rl,
+		lockout: lockout,
+		http:    httpSrv,
 	}
 }
 
@@ -108,6 +148,10 @@ func (srv *Server) Run() error {
 
 	// Close background goroutines.
 	_ = srv.s.Close()
+	srv.lockout.Close()
+	if srv.rl != nil {
+		srv.rl.Close()
+	}
 
 	srv.logger.Info("shutdown complete")
 	return nil

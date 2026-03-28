@@ -51,6 +51,17 @@ func (m *APIKeyMiddleware) LocalAuth(next http.Handler) http.Handler {
 	})
 }
 
+// ValidOnlineKey returns true if key is a valid online API key.
+// Used by AuthLockout.Wrap to perform the check without wrapping again.
+func (m *APIKeyMiddleware) ValidOnlineKey(key string) bool {
+	return m.validKey(key, m.onlineKeys)
+}
+
+// ValidLocalKey returns true if key is a valid local API key.
+func (m *APIKeyMiddleware) ValidLocalKey(key string) bool {
+	return m.validKey(key, m.localKeys)
+}
+
 // AdminAuth wraps h, requiring a valid X-Admin-API-Key header.
 // If no admin key is configured, the handler is passed through unauthenticated.
 func (m *APIKeyMiddleware) AdminAuth(next http.Handler) http.Handler {

@@ -10,11 +10,29 @@ import (
 
 // Config holds all runtime configuration loaded from environment variables.
 type Config struct {
-	Server ServerConfig
-	Auth   AuthConfig
-	Queue  QueueConfig
-	Result ResultConfig
-	Log    LogConfig
+	Server   ServerConfig
+	Auth     AuthConfig
+	Queue    QueueConfig
+	Result   ResultConfig
+	Log      LogConfig
+	Security SecurityConfig
+}
+
+// SecurityConfig holds brute-force and rate-limiting settings.
+type SecurityConfig struct {
+	// RateLimitRPS is the allowed requests per second per IP (token-bucket rate).
+	// 0 disables rate limiting.
+	RateLimitRPS float64
+	// RateLimitBurst is the maximum burst size (tokens the bucket starts full with).
+	RateLimitBurst int
+	// LockoutThreshold is the number of consecutive auth failures before an IP is blocked.
+	LockoutThreshold int
+	// LockoutDuration is how long a locked IP stays blocked.
+	LockoutDuration time.Duration
+	// LockoutWindow is the sliding window within which failures are counted.
+	LockoutWindow time.Duration
+	// MaxBodyBytes is the maximum allowed request body size in bytes.
+	MaxBodyBytes int64
 }
 
 type ServerConfig struct {
@@ -97,6 +115,14 @@ func Load() (*Config, error) {
 			Level:  envString("HR_LOG_LEVEL", "info"),
 			Format: envString("HR_LOG_FORMAT", "json"),
 		},
+		Security: SecurityConfig{
+			RateLimitRPS:     envFloat("HR_RATE_LIMIT_RPS", 50),
+			RateLimitBurst:   envInt("HR_RATE_LIMIT_BURST", 100),
+			LockoutThreshold: envInt("HR_LOCKOUT_THRESHOLD", 10),
+			LockoutDuration:  envDuration("HR_LOCKOUT_DURATION", 15*time.Minute),
+			LockoutWindow:    envDuration("HR_LOCKOUT_WINDOW", 10*time.Minute),
+			MaxBodyBytes:     int64(envInt("HR_MAX_BODY_BYTES", 1<<20)), // 1 MiB
+		},
 	}
 
 	return cfg, nil
@@ -146,6 +172,15 @@ func envDuration(key string, def time.Duration) time.Duration {
 	if v := os.Getenv(key); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
+		}
+	}
+	return def
+}
+
+func envFloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
 		}
 	}
 	return def

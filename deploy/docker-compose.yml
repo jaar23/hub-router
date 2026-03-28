@@ -5,11 +5,14 @@ services:
       dockerfile: deploy/Dockerfile
     ports:
       - "8080:8080"
+
+    # Load secrets from .env (copy deploy/.env.example → deploy/.env and fill in keys).
+    env_file:
+      - path: .env
+        required: false  # falls back to 'environment' block below if absent
     environment:
       HR_PORT: "8080"
-      HR_ONLINE_API_KEYS: "change-me-online-key"
-      HR_LOCAL_API_KEYS: "change-me-local-key"
-      HR_ADMIN_API_KEY: ""
+      HR_HOST: "0.0.0.0"
       HR_QUEUE_MAX_SIZE: "10000"
       HR_REQUEST_TTL: "5m"
       HR_LONGPOLL_TIMEOUT: "30s"
@@ -17,9 +20,44 @@ services:
       HR_RESULT_TTL: "10m"
       HR_LOG_LEVEL: "info"
       HR_LOG_FORMAT: "json"
+      # Security defaults (override in .env for production)
+      HR_RATE_LIMIT_RPS: "50"
+      HR_RATE_LIMIT_BURST: "100"
+      HR_LOCKOUT_THRESHOLD: "10"
+      HR_LOCKOUT_DURATION: "15m"
+      HR_LOCKOUT_WINDOW: "10m"
+      HR_MAX_BODY_BYTES: "1048576"
+
+    # ── Resource limits ──────────────────────────────────────────────────────
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+        reservations:
+          cpus: "0.25"
+          memory: 64M
+
+    # ── Container security hardening ─────────────────────────────────────────
+    security_opt:
+      - no-new-privileges:true   # prevent privilege escalation via setuid binaries
+    read_only: true              # filesystem is immutable (distroless binary only)
+    tmpfs:
+      - /tmp:size=16m,mode=1777  # small writable tmpfs if the binary needs /tmp
+
+    # ── Reliability ──────────────────────────────────────────────────────────
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
-      interval: 10s
+      test: ["/hub-router", "-healthcheck"]
+      interval: 15s
       timeout: 5s
+      start_period: 5s
       retries: 3
+
+    # ── Network isolation ────────────────────────────────────────────────────
+    networks:
+      - hub
+
+networks:
+  hub:
+    driver: bridge
