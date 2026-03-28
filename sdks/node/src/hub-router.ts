@@ -8,10 +8,26 @@
  *   import { OnlineClient, LocalClient } from "./hub-router.js";
  *
  *   const client = new OnlineClient("https://hub.example.com", "api-key");
+ *
+ *   // Simple payload (routes to "default" queue)
  *   const result = await client.do({ query: "hello" });
  *
+ *   // Route to a named queue
+ *   const result = await client.do({ query: "hello" }, {}, { key: "gpu" });
+ *
+ *   // Check the result
+ *   if (result.isError()) throw result.err();
+ *   const data = result.unmarshal<MyType>();
+ *
  *   // Forward an incoming HTTP request verbatim:
- *   const result = await client.doRequest(req);
+ *   const result = await client.doRequest(req, { key: "gpu" });
+ *
+ *   // Local side — pull only from the "gpu" queue
+ *   const local = new LocalClient("https://hub.example.com", "local-key", { key: "gpu" });
+ *   local.run(async (req) => {
+ *     const answer = await myModel.infer(req.payload);
+ *     return { request_id: req.id, payload: answer, status_code: 200 };
+ *   });
  */
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -19,6 +35,7 @@
 /** A pending request pulled by the local server. */
 export interface QueuedRequest {
   id: string;
+  key?: string;
   payload: unknown;
   headers: Record<string, string>;
   enqueued_at: string;
@@ -26,7 +43,7 @@ export interface QueuedRequest {
 }
 
 /** A processed result pushed back by the local server. */
-export interface Result {
+export interface ResultData {
   request_id: string;
   payload: unknown;
   status_code: number;
@@ -56,6 +73,8 @@ export interface OnlineClientOptions {
 
 /** Options for LocalClient. */
 export interface LocalClientOptions {
+  /** Queue key this worker pulls from (empty → "default"). */
+  key?: string;
   /** Requests per poll cycle (default: 10). */
   batchSize?: number;
   /** Sleep in ms when queue is empty (default: 1000). */
@@ -64,8 +83,63 @@ export interface LocalClientOptions {
   workers?: number;
 }
 
+/** Per-request options for OnlineClient methods. */
+export interface RequestOptions {
+  /** Route to a named queue (empty → "default"). */
+  key?: string;
+  /** Per-request long-poll timeout override in milliseconds. */
+  timeout?: number;
+}
+
 /** Processor callback: receives a request, returns a result. */
-export type ProcessorFn = (req: QueuedRequest) => Promise<Result>;
+export type ProcessorFn = (req: QueuedRequest) => Promise<ResultData>;
+
+// ─── Result wrapper ───────────────────────────────────────────────────────────
+
+/**
+ * Result wraps the server response and provides helper methods.
+ *
+ * ```ts
+ * const result = await client.do({ query: "hello" });
+ * if (result.isError()) throw result.err();
+ * const data = result.unmarshal<{ answer: string }>();
+ * ```
+ */
+export class Result {
+  readonly request_id: string;
+  readonly payload: unknown;
+  readonly status_code: number;
+  readonly error?: string;
+  readonly completed_at?: string;
+
+  constructor(data: ResultData) {
+    this.request_id = data.request_id;
+    this.payload = data.payload;
+    this.status_code = data.status_code;
+    this.error = data.error;
+    this.completed_at = data.completed_at;
+  }
+
+  /** Returns true if the result indicates a failure (status >= 400 or non-empty error). */
+  isError(): boolean {
+    return this.status_code >= 400 || !!this.error;
+  }
+
+  /** Returns an Error if isError() is true, else null. */
+  err(): Error | null {
+    if (!this.isError()) return null;
+    const msg = this.error ?? "non-success status";
+    return new HubRouterError(`hub-router: ${msg} (status ${this.status_code})`);
+  }
+
+  /**
+   * Cast the payload to the given type.
+   * The payload is already parsed from JSON — no additional deserialization occurs.
+   */
+  unmarshal<T>(): T {
+    return this.payload as T;
+  }
+}
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -124,12 +198,15 @@ const DEFAULT_MAX_RETRIES = 10;
  * ```ts
  * const client = new OnlineClient("https://hub.example.com", "api-key");
  *
- * // Simple payload
+ * // Simple payload (default queue)
  * const result = await client.do({ query: "hello" });
  *
- * // Forward an incoming HTTP request verbatim (headers + body pass-through)
+ * // Route to a named queue
+ * const result = await client.do({ query: "hello" }, {}, { key: "gpu" });
+ *
+ * // Forward an incoming HTTP request verbatim
  * app.post("/api/infer", async (req, res) => {
- *   const result = await client.doRequest(req);
+ *   const result = await client.doRequest(webReq, { key: "gpu" });
  *   res.json(result.payload);
  * });
  * ```
@@ -159,19 +236,24 @@ export class OnlineClient {
 
   /**
    * Enqueue a request and return its correlation ID.
+   * @param options.key  Route to a named queue (empty → "default").
    * @throws {QueueFullError} if the queue is at capacity.
    */
   async submit(
     payload: unknown,
-    headers: Record<string, string> = {}
+    headers: Record<string, string> = {},
+    options: RequestOptions = {}
   ): Promise<string> {
+    const body: Record<string, unknown> = { payload, headers };
+    if (options.key) body["key"] = options.key;
+
     const res = await fetch(`${this.baseUrl}/request`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-Online-API-Key": this.apiKey,
       },
-      body: JSON.stringify({ payload, headers }),
+      body: JSON.stringify(body),
     });
 
     if (res.status === 503) {
@@ -209,7 +291,7 @@ export class OnlineClient {
         signal: AbortSignal.timeout(timeoutMs + 10_000),
       });
 
-      if (res.status === 200) return (await res.json()) as Result;
+      if (res.status === 200) return new Result((await res.json()) as ResultData);
       if (res.status === 204) continue;
       if (res.status === 404) throw new RequestNotFoundError(requestId);
       throw new HubRouterError(
@@ -226,16 +308,20 @@ export class OnlineClient {
    * Returns `{ result }` when the local server responds before the timeout,
    * or `{ requestId }` when it is slow — caller should then call {@link waitResult}.
    *
+   * @param options.key  Route to a named queue (empty → "default").
    * @throws {QueueFullError} if the queue is at capacity.
    */
   async doSync(
     payload: unknown,
     headers: Record<string, string> = {},
-    options?: { timeout?: number }
+    options: RequestOptions = {}
   ): Promise<{ result: Result } | { requestId: string }> {
-    const timeoutMs = options?.timeout ?? this.longPollTimeoutMs;
+    const timeoutMs = options.timeout ?? this.longPollTimeoutMs;
     const timeoutSec = (timeoutMs / 1000).toFixed(1);
     const url = `${this.baseUrl}/request/sync?timeout=${timeoutSec}s`;
+
+    const body: Record<string, unknown> = { payload, headers };
+    if (options.key) body["key"] = options.key;
 
     const res = await fetch(url, {
       method: "POST",
@@ -243,11 +329,11 @@ export class OnlineClient {
         "Content-Type": "application/json",
         "X-Online-API-Key": this.apiKey,
       },
-      body: JSON.stringify({ payload, headers }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs + 10_000),
     });
 
-    if (res.status === 200) return { result: (await res.json()) as Result };
+    if (res.status === 200) return { result: new Result((await res.json()) as ResultData) };
     if (res.status === 202) {
       const data = (await res.json()) as { id: string };
       return { requestId: data.id };
@@ -264,14 +350,17 @@ export class OnlineClient {
   /**
    * Submit a request and wait for its result.
    * Tries the sync fast path first; falls back to async polling if the local server is slow.
+   *
+   * @param options.key  Route to a named queue (empty → "default").
    */
   async do(
     payload: unknown,
-    headers: Record<string, string> = {}
+    headers: Record<string, string> = {},
+    options: RequestOptions = {}
   ): Promise<Result> {
-    const response = await this.doSync(payload, headers);
+    const response = await this.doSync(payload, headers, options);
     if ("result" in response) return response.result;
-    return this.waitResult(response.requestId);
+    return this.waitResult(response.requestId, { timeout: options.timeout });
   }
 
   /**
@@ -282,17 +371,19 @@ export class OnlineClient {
    *
    * Compatible with the Web API `Request` object (Node.js 18+, Deno, Cloudflare Workers).
    *
+   * @param options.key  Route to a named queue (empty → "default").
+   *
    * ```ts
    * app.post("/api/infer", async (req, res) => {
    *   const webReq = new Request(req.url, { method: req.method, headers: req.headers, body: req });
-   *   const result = await client.doRequest(webReq);
+   *   const result = await client.doRequest(webReq, { key: "gpu" });
    *   res.json(result.payload);
    * });
    * ```
    */
   async doRequest(
     request: Request,
-    options?: { timeout?: number }
+    options: RequestOptions = {}
   ): Promise<Result> {
     const headers: Record<string, string> = {};
     request.headers.forEach((value, key) => {
@@ -304,7 +395,7 @@ export class OnlineClient {
     const payload = await request.text();
     const response = await this.doSync(payload, headers, options);
     if ("result" in response) return response.result;
-    return this.waitResult(response.requestId);
+    return this.waitResult(response.requestId, { timeout: options.timeout });
   }
 }
 
@@ -319,7 +410,8 @@ const DEFAULT_WORKERS = 1;
  * Fully async, non-blocking. The poll loop runs as an independent Promise.
  *
  * ```ts
- * const client = new LocalClient("https://hub.example.com", "local-key");
+ * // Pull only from the "gpu" queue
+ * const client = new LocalClient("https://hub.example.com", "local-key", { key: "gpu" });
  *
  * // Fire-and-forget alongside your server
  * client.run(async (req) => {
@@ -331,6 +423,7 @@ const DEFAULT_WORKERS = 1;
 export class LocalClient {
   private readonly baseUrl: string;
   private readonly apiKey: string;
+  private readonly key: string;
   private readonly batchSize: number;
   private readonly pollIntervalMs: number;
   private readonly workers: number;
@@ -339,7 +432,7 @@ export class LocalClient {
   /**
    * @param baseUrl  hub-router base URL, e.g. "https://hub.example.com"
    * @param apiKey   X-Local-API-Key value
-   * @param options  Optional overrides
+   * @param options  Optional overrides (including `key` for named queue)
    */
   constructor(
     baseUrl: string,
@@ -348,6 +441,7 @@ export class LocalClient {
   ) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.apiKey = apiKey;
+    this.key = options.key ?? "";
     this.batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE;
     this.pollIntervalMs = options.pollInterval ?? DEFAULT_POLL_INTERVAL_MS;
     this.workers = options.workers ?? DEFAULT_WORKERS;
@@ -407,12 +501,13 @@ export class LocalClient {
     this.stopped = true;
   }
 
-  /** Fetch up to `batchSize` pending requests. */
+  /** Fetch up to `batchSize` pending requests for this client's key. */
   async pullBatch(): Promise<QueuedRequest[]> {
-    const res = await fetch(
-      `${this.baseUrl}/queue/pull?batch=${this.batchSize}`,
-      { headers: { "X-Local-API-Key": this.apiKey } }
-    );
+    let url = `${this.baseUrl}/queue/pull?batch=${this.batchSize}`;
+    if (this.key) url += `&key=${encodeURIComponent(this.key)}`;
+    const res = await fetch(url, {
+      headers: { "X-Local-API-Key": this.apiKey },
+    });
     if (res.status !== 200) {
       throw new HubRouterError(
         `unexpected status ${res.status}: ${await res.text()}`
@@ -423,8 +518,8 @@ export class LocalClient {
   }
 
   /** Push a completed result to hub-router. */
-  async pushResult(result: Result): Promise<void> {
-    const body: Result = {
+  async pushResult(result: ResultData): Promise<void> {
+    const body: ResultData = {
       ...result,
       completed_at: result.completed_at ?? new Date().toISOString(),
     };
@@ -448,7 +543,7 @@ export class LocalClient {
     processor: ProcessorFn,
     req: QueuedRequest
   ): Promise<void> {
-    let result: Result;
+    let result: ResultData;
     try {
       result = await processor(req);
     } catch (err) {

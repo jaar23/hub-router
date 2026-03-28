@@ -15,17 +15,18 @@ import (
 
 // OnlineHandler handles requests from the online (web app) server.
 type OnlineHandler struct {
-	q   queue.Queue
+	q   *queue.KeyedQueue
 	s   store.ResultStore
 	cfg *config.Config
 }
 
 // NewOnlineHandler creates a handler wired to the given queue and store.
-func NewOnlineHandler(q queue.Queue, s store.ResultStore, cfg *config.Config) *OnlineHandler {
+func NewOnlineHandler(q *queue.KeyedQueue, s store.ResultStore, cfg *config.Config) *OnlineHandler {
 	return &OnlineHandler{q: q, s: s, cfg: cfg}
 }
 
 type submitRequest struct {
+	Key     string            `json:"key"`
 	Payload json.RawMessage   `json:"payload"`
 	Headers map[string]string `json:"headers"`
 }
@@ -52,13 +53,14 @@ func (h *OnlineHandler) HandleSubmit(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	req := &model.QueuedRequest{
 		ID:         id.String(),
+		Key:        body.Key,
 		Payload:    body.Payload,
 		Headers:    body.Headers,
 		EnqueuedAt: now,
 		ExpiresAt:  now.Add(h.cfg.Queue.RequestTTL),
 	}
 
-	if enqErr := h.q.Enqueue(r.Context(), req); enqErr == queue.ErrQueueFull {
+	if enqErr := h.q.Enqueue(r.Context(), body.Key, req); enqErr == queue.ErrQueueFull {
 		writeError(w, http.StatusServiceUnavailable, "QUEUE_FULL", "queue is at capacity, try again later")
 		return
 	} else if enqErr != nil {
@@ -69,7 +71,7 @@ func (h *OnlineHandler) HandleSubmit(w http.ResponseWriter, r *http.Request) {
 	// Register the ID as pending so Get can distinguish "not yet ready" from "unknown".
 	h.s.RegisterPending(req.ID)
 
-	depth := h.q.Len()
+	depth := h.q.TotalLen()
 	resp := model.SubmitResponse{
 		ID:              req.ID,
 		EstimatedWaitMs: int64(depth) * 100, // rough estimate: 100ms per queued item
@@ -108,6 +110,7 @@ func (h *OnlineHandler) HandleSync(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	req := &model.QueuedRequest{
 		ID:         id.String(),
+		Key:        body.Key,
 		Payload:    body.Payload,
 		Headers:    body.Headers,
 		EnqueuedAt: now,
@@ -119,7 +122,7 @@ func (h *OnlineHandler) HandleSync(w http.ResponseWriter, r *http.Request) {
 	// the result before we reach the Get.
 	h.s.RegisterPending(req.ID)
 
-	if enqErr := h.q.Enqueue(r.Context(), req); enqErr == queue.ErrQueueFull {
+	if enqErr := h.q.Enqueue(r.Context(), body.Key, req); enqErr == queue.ErrQueueFull {
 		// Clean up the pending registration since we won't be waiting.
 		_ = h.s.Delete(r.Context(), req.ID)
 		writeError(w, http.StatusServiceUnavailable, "QUEUE_FULL", "queue is at capacity, try again later")
@@ -157,7 +160,7 @@ func (h *OnlineHandler) HandleSync(w http.ResponseWriter, r *http.Request) {
 
 	// Slow path: timeout elapsed — fall back to async. Return 202 with the
 	// correlation ID so the client can poll GET /result/{id}.
-	depth := h.q.Len()
+	depth := h.q.TotalLen()
 	resp := model.SubmitResponse{
 		ID:              req.ID,
 		EstimatedWaitMs: int64(depth)*100 + timeout.Milliseconds(),

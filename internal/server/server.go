@@ -20,7 +20,7 @@ import (
 type Server struct {
 	cfg     *config.Config
 	logger  *slog.Logger
-	q       *queue.MemoryQueue
+	q       *queue.KeyedQueue
 	s       *store.MemoryStore
 	rl      *middleware.RateLimiter
 	lockout *middleware.AuthLockout
@@ -29,7 +29,7 @@ type Server struct {
 
 // New creates a Server from configuration.
 func New(cfg *config.Config, logger *slog.Logger) *Server {
-	q := queue.NewMemoryQueue(cfg.Queue.MaxSize)
+	q := queue.NewKeyedQueue(cfg.Queue.MaxSize)
 	s := store.NewMemoryStore(cfg.Result.ResultTTL)
 
 	auth := middleware.NewAPIKeyMiddleware(cfg.Auth.OnlineAPIKeys, cfg.Auth.LocalAPIKeys, cfg.Auth.AdminAPIKey)

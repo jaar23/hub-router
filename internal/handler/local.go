@@ -14,18 +14,18 @@ import (
 
 // LocalHandler handles requests from the local processing server.
 type LocalHandler struct {
-	q   queue.Queue
+	q   *queue.KeyedQueue
 	s   store.ResultStore
 	cfg *config.Config
 }
 
 // NewLocalHandler creates a handler wired to the given queue and store.
-func NewLocalHandler(q queue.Queue, s store.ResultStore, cfg *config.Config) *LocalHandler {
+func NewLocalHandler(q *queue.KeyedQueue, s store.ResultStore, cfg *config.Config) *LocalHandler {
 	return &LocalHandler{q: q, s: s, cfg: cfg}
 }
 
-// HandlePull handles GET /queue/pull?batch=N.
-// Returns up to N pending requests immediately (never blocks).
+// HandlePull handles GET /queue/pull?batch=N&key=K.
+// Returns up to N pending requests for the given key immediately (never blocks).
 // Returns an empty array when the queue is empty.
 func (h *LocalHandler) HandlePull(w http.ResponseWriter, r *http.Request) {
 	batchSize := h.cfg.Queue.MaxBatchSize
@@ -37,7 +37,9 @@ func (h *LocalHandler) HandlePull(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	requests, err := h.q.Dequeue(r.Context(), batchSize)
+	key := r.URL.Query().Get("key") // empty string → KeyedQueue normalises to "default"
+
+	requests, err := h.q.Dequeue(r.Context(), key, batchSize)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to dequeue requests")
 		return

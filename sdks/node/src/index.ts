@@ -6,6 +6,7 @@
 export {
   OnlineClient,
   LocalClient,
+  Result,
   HubRouterError,
   QueueFullError,
   RequestNotFoundError,
@@ -14,10 +15,11 @@ export {
 
 export type {
   QueuedRequest,
-  Result,
+  ResultData,
   SubmitResponse,
   PullResponse,
   OnlineClientOptions,
   LocalClientOptions,
+  RequestOptions,
   ProcessorFn,
 } from "./hub-router.js";

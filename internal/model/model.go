@@ -8,9 +8,10 @@ import (
 // QueuedRequest is the unit stored in the pending queue.
 // It is created by the online server and consumed by the local server.
 type QueuedRequest struct {
-	ID         string            `json:"id"`          // UUIDv7 — time-sortable, globally unique
-	Payload    json.RawMessage   `json:"payload"`     // opaque to middleware
-	Headers    map[string]string `json:"headers"`     // forwarded headers from original request
+	ID         string            `json:"id"`            // UUIDv7 — time-sortable, globally unique
+	Key        string            `json:"key,omitempty"` // routing key; empty means "default"
+	Payload    json.RawMessage   `json:"payload"`       // opaque to middleware
+	Headers    map[string]string `json:"headers"`       // forwarded headers from original request
 	EnqueuedAt time.Time         `json:"enqueued_at"`
 	ExpiresAt  time.Time         `json:"expires_at"`
 }
@@ -57,10 +58,10 @@ type HealthResponse struct {
 
 // StatsResponse is returned by GET /debug/stats — a detailed snapshot for the TUI.
 type StatsResponse struct {
-	UptimeSeconds int64         `json:"uptime_seconds"`
-	Queue         QueueStats    `json:"queue"`
-	Store         StoreStats    `json:"store"`
-	Security      SecurityStats `json:"security"`
+	UptimeSeconds int64                 `json:"uptime_seconds"`
+	Queues        map[string]QueueStats `json:"queues"` // keyed by routing key; "default" is always present
+	Store         StoreStats            `json:"store"`
+	Security      SecurityStats         `json:"security"`
 }
 
 // QueueStats holds queue counters for the stats endpoint.

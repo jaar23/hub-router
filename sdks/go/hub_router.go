@@ -7,8 +7,16 @@
 //
 //	client := NewOnlineClient("https://hub.example.com", "api-key")
 //
-//	// Simple payload
+//	// Simple payload (routes to "default" queue)
 //	result, err := client.Do(ctx, map[string]any{"query": "hello"}, nil)
+//
+//	// Route to a named queue
+//	result, err := client.Do(ctx, payload, nil, WithKey("gpu"))
+//
+//	// Check the result
+//	if result.IsError() { log.Fatal(result.Err()) }
+//	var out MyStruct
+//	_ = result.Unmarshal(&out)
 //
 //	// Forward an incoming HTTP request verbatim (headers + body pass-through)
 //	func handler(w http.ResponseWriter, r *http.Request) {
@@ -16,8 +24,8 @@
 //	    json.NewEncoder(w).Encode(result.Payload)
 //	}
 //
-//	// Local side — process requests from the queue
-//	local := NewLocalClient("https://hub.example.com", "local-key")
+//	// Local side — pull only from the "gpu" queue
+//	local := NewLocalClient("https://hub.example.com", "local-key", WithLocalKey("gpu"))
 //	local.Run(ctx, func(ctx context.Context, req *QueuedRequest) (*Result, error) {
 //	    resp := myModel.Infer(req.Payload)
 //	    return &Result{RequestID: req.ID, Payload: resp}, nil
@@ -41,6 +49,7 @@ import (
 // QueuedRequest is a pending request pulled by the local server.
 type QueuedRequest struct {
 	ID         string            `json:"id"`
+	Key        string            `json:"key,omitempty"`
 	Payload    json.RawMessage   `json:"payload"`
 	Headers    map[string]string `json:"headers"`
 	EnqueuedAt time.Time         `json:"enqueued_at"`
@@ -54,6 +63,28 @@ type Result struct {
 	StatusCode  int             `json:"status_code"`
 	Error       string          `json:"error,omitempty"`
 	CompletedAt time.Time       `json:"completed_at"`
+}
+
+// IsError reports whether the result indicates a failure (status >= 400 or non-empty Error field).
+func (r *Result) IsError() bool {
+	return r.StatusCode >= 400 || r.Error != ""
+}
+
+// Err returns an error if IsError is true, or nil otherwise.
+func (r *Result) Err() error {
+	if !r.IsError() {
+		return nil
+	}
+	msg := r.Error
+	if msg == "" {
+		msg = "non-success status"
+	}
+	return fmt.Errorf("hub-router: %s (status %d)", msg, r.StatusCode)
+}
+
+// Unmarshal decodes the JSON Payload into v.
+func (r *Result) Unmarshal(v any) error {
+	return json.Unmarshal(r.Payload, v)
 }
 
 // SubmitResponse is returned by POST /request and POST /request/sync (202).
@@ -84,6 +115,21 @@ var hopByHopHeaders = map[string]bool{
 
 func defaultHTTPClient() *http.Client {
 	return &http.Client{Timeout: 60 * time.Second}
+}
+
+// ─── RequestOption ────────────────────────────────────────────────────────────
+
+type requestOpts struct {
+	key string
+}
+
+// RequestOption configures a single request.
+type RequestOption func(*requestOpts)
+
+// WithKey routes the request to the named queue.
+// If not set (or set to ""), the server routes to the "default" queue.
+func WithKey(key string) RequestOption {
+	return func(o *requestOpts) { o.key = key }
 }
 
 // ─── OnlineClient ─────────────────────────────────────────────────────────────
@@ -131,11 +177,14 @@ func WithHTTPClient(hc *http.Client) func(*OnlineClient) {
 
 // Submit enqueues a request and returns its correlation ID.
 // headers is optional metadata forwarded with the request.
+// Pass WithKey("name") to route to a specific worker queue.
 func (c *OnlineClient) Submit(
 	ctx context.Context,
 	payload any,
 	headers map[string]string,
+	reqOpts ...RequestOption,
 ) (string, error) {
+	opts := applyRequestOpts(reqOpts)
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("marshal payload: %w", err)
@@ -143,6 +192,9 @@ func (c *OnlineClient) Submit(
 	body := map[string]any{
 		"payload": json.RawMessage(payloadBytes),
 		"headers": headers,
+	}
+	if opts.key != "" {
+		body["key"] = opts.key
 	}
 	bodyBytes, _ := json.Marshal(body)
 
@@ -236,7 +288,9 @@ func (c *OnlineClient) DoSync(
 	ctx context.Context,
 	payload any,
 	headers map[string]string,
+	reqOpts ...RequestOption,
 ) (*Result, string, error) {
+	opts := applyRequestOpts(reqOpts)
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return nil, "", fmt.Errorf("marshal payload: %w", err)
@@ -244,6 +298,9 @@ func (c *OnlineClient) DoSync(
 	body := map[string]any{
 		"payload": json.RawMessage(payloadBytes),
 		"headers": headers,
+	}
+	if opts.key != "" {
+		body["key"] = opts.key
 	}
 	bodyBytes, _ := json.Marshal(body)
 
@@ -292,12 +349,14 @@ func (c *OnlineClient) DoSync(
 // Do submits a request and waits for its result.
 // Uses DoSync for a single round-trip when the local server is fast,
 // falling back to WaitResult for slow processors. Transparent to the caller.
+// Pass WithKey("name") to route to a specific worker queue.
 func (c *OnlineClient) Do(
 	ctx context.Context,
 	payload any,
 	headers map[string]string,
+	reqOpts ...RequestOption,
 ) (*Result, error) {
-	result, id, err := c.DoSync(ctx, payload, headers)
+	result, id, err := c.DoSync(ctx, payload, headers, reqOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -309,17 +368,15 @@ func (c *OnlineClient) Do(
 
 // DoRequest extracts the body and headers from an incoming *http.Request and
 // forwards them verbatim to hub-router. Hop-by-hop headers are excluded.
-//
-// This makes hub-router behave as a transparent proxy: the local server
-// receives the exact headers and body that the original client sent.
+// Pass WithKey("name") to route to a specific worker queue.
 //
 //	func handler(w http.ResponseWriter, r *http.Request) {
-//	    result, err := client.DoRequest(r.Context(), r)
+//	    result, err := client.DoRequest(r.Context(), r, WithKey("gpu"))
 //	    if err != nil { http.Error(w, err.Error(), 502); return }
 //	    w.Header().Set("Content-Type", "application/json")
 //	    w.Write(result.Payload)
 //	}
-func (c *OnlineClient) DoRequest(ctx context.Context, r *http.Request) (*Result, error) {
+func (c *OnlineClient) DoRequest(ctx context.Context, r *http.Request, reqOpts ...RequestOption) (*Result, error) {
 	headers := make(map[string]string)
 	for k, vals := range r.Header {
 		if !hopByHopHeaders[k] {
@@ -336,7 +393,15 @@ func (c *OnlineClient) DoRequest(ctx context.Context, r *http.Request) (*Result,
 		payload = string(raw)
 	}
 
-	return c.Do(ctx, payload, headers)
+	return c.Do(ctx, payload, headers, reqOpts...)
+}
+
+func applyRequestOpts(opts []RequestOption) requestOpts {
+	var o requestOpts
+	for _, fn := range opts {
+		fn(&o)
+	}
+	return o
 }
 
 // ─── LocalClient ─────────────────────────────────────────────────────────────
@@ -350,6 +415,7 @@ type ProcessorFunc func(ctx context.Context, req *QueuedRequest) (*Result, error
 type LocalClient struct {
 	baseURL      string
 	apiKey       string
+	key          string // routing key to pull from (empty = "default")
 	batchSize    int
 	pollInterval time.Duration
 	workers      int
@@ -357,7 +423,7 @@ type LocalClient struct {
 }
 
 // NewLocalClient creates a LocalClient with sensible defaults.
-// Functional options (WithBatchSize, WithPollInterval, WithWorkers, WithLocalHTTPClient) may be applied.
+// Functional options (WithLocalKey, WithBatchSize, WithPollInterval, WithWorkers, WithLocalHTTPClient) may be applied.
 func NewLocalClient(baseURL, apiKey string, opts ...func(*LocalClient)) *LocalClient {
 	c := &LocalClient{
 		baseURL:      strings.TrimRight(baseURL, "/"),
@@ -371,6 +437,12 @@ func NewLocalClient(baseURL, apiKey string, opts ...func(*LocalClient)) *LocalCl
 		fn(c)
 	}
 	return c
+}
+
+// WithLocalKey sets the queue key this worker pulls from (e.g. "gpu", "cpu").
+// Leave empty (or omit) to pull from the "default" queue.
+func WithLocalKey(key string) func(*LocalClient) {
+	return func(c *LocalClient) { c.key = key }
 }
 
 // WithBatchSize sets the number of requests to pull per poll cycle.
@@ -443,9 +515,12 @@ done:
 	return ctx.Err()
 }
 
-// PullBatch fetches up to batchSize pending requests. Never blocks.
+// PullBatch fetches up to batchSize pending requests for this client's key. Never blocks.
 func (c *LocalClient) PullBatch(ctx context.Context) ([]*QueuedRequest, error) {
 	url := fmt.Sprintf("%s/queue/pull?batch=%d", c.baseURL, c.batchSize)
+	if c.key != "" {
+		url += "&key=" + c.key
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err

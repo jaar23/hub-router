@@ -14,16 +14,16 @@ import (
 
 // AdminHandler handles health, metrics, and stats endpoints.
 type AdminHandler struct {
-	q         *queue.MemoryQueue
+	q         *queue.KeyedQueue
 	s         *store.MemoryStore
-	rl        *middleware.RateLimiter  // nil when rate limiting is disabled
+	rl        *middleware.RateLimiter // nil when rate limiting is disabled
 	al        *middleware.AuthLockout
 	startTime time.Time
 }
 
 // NewAdminHandler creates an admin handler.
 func NewAdminHandler(
-	q *queue.MemoryQueue,
+	q *queue.KeyedQueue,
 	s *store.MemoryStore,
 	rl *middleware.RateLimiter,
 	al *middleware.AuthLockout,
@@ -35,7 +35,7 @@ func NewAdminHandler(
 func (h *AdminHandler) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	resp := model.HealthResponse{
 		Status:        "ok",
-		QueueDepth:    h.q.Len(),
+		QueueDepth:    h.q.TotalLen(),
 		UptimeSeconds: int64(time.Since(h.startTime).Seconds()),
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -45,18 +45,9 @@ func (h *AdminHandler) HandleHealth(w http.ResponseWriter, r *http.Request) {
 
 // HandleStats handles GET /debug/stats — returns a detailed snapshot for the TUI.
 func (h *AdminHandler) HandleStats(w http.ResponseWriter, r *http.Request) {
-	enqueued, dequeued, expired, dropped := h.q.Stats()
-
 	resp := model.StatsResponse{
 		UptimeSeconds: int64(time.Since(h.startTime).Seconds()),
-		Queue: model.QueueStats{
-			Depth:         h.q.Len(),
-			Capacity:      h.q.Cap(),
-			EnqueuedTotal: enqueued,
-			DequeuedTotal: dequeued,
-			ExpiredTotal:  expired,
-			DroppedTotal:  dropped,
-		},
+		Queues:        h.q.StatsAll(),
 		Store: model.StoreStats{
 			Results:       h.s.ResultCount(),
 			ActiveWaiters: h.s.ActiveWaiters(),

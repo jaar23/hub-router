@@ -7,15 +7,23 @@ Usage::
 
     from hub_router import OnlineClient, LocalClient
 
-    # Online side — submit and wait for results
+    # Online side — submit and wait for results (routes to "default" queue)
     client = OnlineClient("https://hub.example.com", api_key="secret")
     result = await client.do({"query": "hello"})
 
-    # Forward an incoming FastAPI/Starlette request verbatim
-    result = await client.do_request(request)
+    # Route to a named queue
+    result = await client.do({"query": "hello"}, key="gpu")
 
-    # Local side — process requests from the queue
-    local = LocalClient("https://hub.example.com", api_key="local-secret")
+    # Check the result
+    if result.is_error():
+        raise result.err()
+    data = result.unmarshal()        # returns parsed payload
+
+    # Forward an incoming FastAPI/Starlette request verbatim
+    result = await client.do_request(request, key="gpu")
+
+    # Local side — pull only from the "gpu" queue
+    local = LocalClient("https://hub.example.com", api_key="local-secret", key="gpu")
     async def process(req):
         return Result(request_id=req.id, payload=await my_model(req.payload))
     await local.run(process)
@@ -25,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -58,6 +67,7 @@ class QueuedRequest:
 
     id: str
     payload: Any
+    key: str = ""
     headers: dict[str, str] = field(default_factory=dict)
     enqueued_at: Optional[datetime] = None
     expires_at: Optional[datetime] = None
@@ -67,6 +77,7 @@ class QueuedRequest:
         return cls(
             id=data["id"],
             payload=data["payload"],
+            key=data.get("key", ""),
             headers=data.get("headers") or {},
             enqueued_at=_parse_dt(data.get("enqueued_at")),
             expires_at=_parse_dt(data.get("expires_at")),
@@ -82,6 +93,21 @@ class Result:
     status_code: int = 200
     error: str = ""
     completed_at: Optional[datetime] = None
+
+    def is_error(self) -> bool:
+        """Return True if the result indicates a failure (status >= 400 or non-empty error)."""
+        return self.status_code >= 400 or bool(self.error)
+
+    def err(self) -> Optional[Exception]:
+        """Return an Exception if is_error() is True, else None."""
+        if not self.is_error():
+            return None
+        msg = self.error or "non-success status"
+        return HubRouterError(f"hub-router: {msg} (status {self.status_code})")
+
+    def unmarshal(self) -> Any:
+        """Return the payload as a Python object (already decoded from JSON)."""
+        return self.payload
 
     def to_dict(self) -> dict:
         return {
@@ -178,10 +204,13 @@ class OnlineClient:
         result = await client.do({"query": "hello"})
         print(result.payload)
 
+        # Route to a named queue
+        result = await client.do({"query": "hello"}, key="gpu")
+
         # Forward an incoming request verbatim (FastAPI example)
         @app.post("/infer")
         async def infer(request: Request):
-            result = await client.do_request(request)
+            result = await client.do_request(request, key="gpu")
             return result.payload
     """
 
@@ -202,13 +231,19 @@ class OnlineClient:
         self,
         payload: Any,
         headers: Optional[dict[str, str]] = None,
+        *,
+        key: str = "",
     ) -> str:
         """
         Enqueue a request and return its correlation ID.
 
+        :param key: Route to a named queue (empty → "default").
         :raises QueueFullError: If the middleware queue is at capacity.
         """
-        body = json.dumps({"payload": payload, "headers": headers or {}}).encode()
+        body_data: dict[str, Any] = {"payload": payload, "headers": headers or {}}
+        if key:
+            body_data["key"] = key
+        body = json.dumps(body_data).encode()
         status, raw = await _http(
             "POST",
             f"{self._base_url}/request",
@@ -264,6 +299,7 @@ class OnlineClient:
         payload: Any,
         headers: Optional[dict[str, str]] = None,
         *,
+        key: str = "",
         timeout: Optional[float] = None,
     ) -> tuple[Optional[Result], Optional[str]]:
         """
@@ -272,10 +308,14 @@ class OnlineClient:
         Returns ``(Result, None)`` if the local server responds before the timeout,
         or ``(None, request_id)`` on slow path — continue with :meth:`wait_result`.
 
+        :param key: Route to a named queue (empty → "default").
         :raises QueueFullError: If the queue is at capacity.
         """
         t = timeout or self._long_poll_timeout
-        body = json.dumps({"payload": payload, "headers": headers or {}}).encode()
+        body_data: dict[str, Any] = {"payload": payload, "headers": headers or {}}
+        if key:
+            body_data["key"] = key
+        body = json.dumps(body_data).encode()
         status, raw = await _http(
             "POST",
             f"{self._base_url}/request/sync?timeout={t}s",
@@ -297,14 +337,18 @@ class OnlineClient:
         self,
         payload: Any,
         headers: Optional[dict[str, str]] = None,
+        *,
+        key: str = "",
     ) -> Result:
         """
         Submit a request and wait for its result.
 
         Tries the sync fast path first (single round-trip when local server is fast).
         Falls back to async polling transparently when local server is slow.
+
+        :param key: Route to a named queue (empty → "default").
         """
-        result, request_id = await self.do_sync(payload, headers)
+        result, request_id = await self.do_sync(payload, headers, key=key)
         if result is not None:
             return result
         return await self.wait_result(request_id)  # type: ignore[arg-type]
@@ -313,6 +357,7 @@ class OnlineClient:
         self,
         request: Any,
         *,
+        key: str = "",
         timeout: Optional[float] = None,
     ) -> Result:
         """
@@ -320,6 +365,8 @@ class OnlineClient:
 
         The original headers and body are passed through to the local server
         unchanged. Hop-by-hop headers (Content-Length, Host, etc.) are excluded.
+
+        :param key: Route to a named queue (empty → "default").
 
         Accepts any request object with:
         - ``.headers`` — dict-like mapping of header name → value
@@ -329,7 +376,7 @@ class OnlineClient:
 
             @app.post("/infer")
             async def infer(request: Request):
-                result = await client.do_request(request)
+                result = await client.do_request(request, key="gpu")
                 return result.payload
         """
         # Extract headers, skipping hop-by-hop
@@ -354,7 +401,7 @@ class OnlineClient:
             if isinstance(raw_body, bytes)
             else str(raw_body or "")
         )
-        return await self.do(payload, fwd_headers)
+        return await self.do(payload, fwd_headers, key=key)
 
 
 # ─── LocalClient ─────────────────────────────────────────────────────────────
@@ -372,8 +419,9 @@ class LocalClient:
             answer = await my_model.infer(req.payload)
             return Result(request_id=req.id, payload=answer)
 
+        # Pull only from the "gpu" queue
         client = LocalClient("https://hub.example.com", api_key="local-secret",
-                             batch_size=20, workers=5)
+                             key="gpu", batch_size=20, workers=5)
         # Run alongside other async tasks:
         task = asyncio.create_task(client.run(process))
         # Or block:
@@ -385,12 +433,14 @@ class LocalClient:
         base_url: str,
         api_key: str,
         *,
+        key: str = "",
         batch_size: int = 10,
         poll_interval: float = 1.0,
         workers: int = 1,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
+        self._key = key
         self._batch_size = batch_size
         self._poll_interval = poll_interval
         self._workers = workers
@@ -434,10 +484,13 @@ class LocalClient:
             await asyncio.gather(*pending_tasks, return_exceptions=True)
 
     async def pull_batch(self) -> list[QueuedRequest]:
-        """Fetch up to ``batch_size`` pending requests. Never blocks."""
+        """Fetch up to ``batch_size`` pending requests for this client's key. Never blocks."""
+        url = f"{self._base_url}/queue/pull?batch={self._batch_size}"
+        if self._key:
+            url += f"&key={urllib.parse.quote(self._key)}"
         status, raw = await _http(
             "GET",
-            f"{self._base_url}/queue/pull?batch={self._batch_size}",
+            url,
             headers={"X-Local-API-Key": self._api_key},
         )
         if status != 200:

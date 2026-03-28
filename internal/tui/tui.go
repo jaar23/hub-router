@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/jaar23/hub-router/internal/model"
+	"github.com/jaar23/hub-router/internal/queue"
 )
 
 // ── styles ────────────────────────────────────────────────────────────────────
@@ -55,6 +57,10 @@ var (
 			Foreground(lipgloss.Color("255")).
 			Background(lipgloss.Color("62")).
 			Padding(0, 2)
+
+	styleKey = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("111")).
+			Bold(true)
 )
 
 // sparkline characters ordered from empty to full
@@ -63,7 +69,7 @@ var sparkChars = []rune{'▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
 const (
 	historyLen      = 30
 	refreshInterval = time.Second
-	panelWidth      = 32
+	panelWidth      = 38
 )
 
 // ── messages ──────────────────────────────────────────────────────────────────
@@ -78,17 +84,17 @@ type tickMsg time.Time
 // ── model ─────────────────────────────────────────────────────────────────────
 
 type tuiModel struct {
-	addr    string
-	apiKey  string
-	client  *http.Client
+	addr   string
+	apiKey string
+	client *http.Client
 
 	stats      *model.StatsResponse
 	lastUpdate time.Time
 	fetchErr   error
 
-	// ring buffer of queue depths for sparkline
+	// ring buffer of total queue depths for sparkline
 	depthHistory []int
-	// throughput: (enqueued delta) / interval
+	// throughput: (total enqueued delta) / interval
 	prevEnqueued int64
 	throughput   float64
 }
@@ -162,23 +168,52 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.stats = msg.stats
 		m.lastUpdate = time.Now()
 
+		// Compute aggregate totals across all keys
+		totalDepth, totalEnqueued := aggregateTotals(msg.stats.Queues)
+
 		// Update depth history ring buffer
-		depth := msg.stats.Queue.Depth
 		if len(m.depthHistory) >= historyLen {
 			m.depthHistory = m.depthHistory[1:]
 		}
-		m.depthHistory = append(m.depthHistory, depth)
+		m.depthHistory = append(m.depthHistory, totalDepth)
 
 		// Calculate throughput
 		if prev != nil {
-			delta := msg.stats.Queue.EnqueuedTotal - m.prevEnqueued
+			delta := totalEnqueued - m.prevEnqueued
 			if delta >= 0 {
 				m.throughput = float64(delta) / refreshInterval.Seconds()
 			}
 		}
-		m.prevEnqueued = msg.stats.Queue.EnqueuedTotal
+		m.prevEnqueued = totalEnqueued
 	}
 	return m, nil
+}
+
+// aggregateTotals sums depth and enqueued across all keys.
+func aggregateTotals(queues map[string]model.QueueStats) (totalDepth int, totalEnqueued int64) {
+	for _, qs := range queues {
+		totalDepth += qs.Depth
+		totalEnqueued += qs.EnqueuedTotal
+	}
+	return
+}
+
+// sortedKeys returns queue keys sorted with "default" first, then alphabetically.
+func sortedKeys(queues map[string]model.QueueStats) []string {
+	keys := make([]string, 0, len(queues))
+	for k := range queues {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i] == queue.DefaultKey {
+			return true
+		}
+		if keys[j] == queue.DefaultKey {
+			return false
+		}
+		return keys[i] < keys[j]
+	})
+	return keys
 }
 
 // ── view ──────────────────────────────────────────────────────────────────────
@@ -218,13 +253,27 @@ func renderDashboard(m tuiModel) string {
 	header := styleHeader.Render(" hub-router ") +
 		"  " + styleDim.Render("uptime: "+uptime)
 
-	// ── queue panel ──────────────────────────────────────────────────────────
-	queueContent := styleTitle.Render("QUEUE") + "\n" +
-		row("depth    ", fmt.Sprintf("%d / %s", s.Queue.Depth, fmtInt(int64(s.Queue.Capacity))), depthColor(s.Queue.Depth, s.Queue.Capacity)) +
-		row("enqueued ", fmtInt(s.Queue.EnqueuedTotal), "") +
-		row("dequeued ", fmtInt(s.Queue.DequeuedTotal), "") +
-		row("expired  ", fmtInt(s.Queue.ExpiredTotal), warnColor(s.Queue.ExpiredTotal)) +
-		row("dropped  ", fmtInt(s.Queue.DroppedTotal), warnColor(s.Queue.DroppedTotal))
+	// ── queues panel (one row per key) ───────────────────────────────────────
+	keys := sortedKeys(s.Queues)
+	var queueRows strings.Builder
+	for _, k := range keys {
+		qs := s.Queues[k]
+		label := styleKey.Render("[" + k + "]")
+		depthStr := depthColor(qs.Depth, qs.Capacity)
+		enqStr := styleLabel.Render(" enq:") + styleValue.Render(fmtInt(qs.EnqueuedTotal))
+		deqStr := styleLabel.Render(" deq:") + styleValue.Render(fmtInt(qs.DequeuedTotal))
+		queueRows.WriteString(label + " " + depthStr + "  " + enqStr + " " + deqStr + "\n")
+		if qs.ExpiredTotal > 0 || qs.DroppedTotal > 0 {
+			queueRows.WriteString(
+				styleLabel.Render("       exp:") + warnColor(qs.ExpiredTotal) +
+					styleLabel.Render(" drop:") + warnColor(qs.DroppedTotal) + "\n",
+			)
+		}
+	}
+	if len(keys) == 0 {
+		queueRows.WriteString(styleDim.Render("(no queues yet)") + "\n")
+	}
+	queueContent := styleTitle.Render("QUEUES") + "\n" + queueRows.String()
 	queuePanel := styleBorder.Width(panelWidth).Render(queueContent)
 
 	// ── throughput panel ─────────────────────────────────────────────────────
@@ -276,12 +325,6 @@ func renderDashboard(m tuiModel) string {
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 func row(label, value, colorFn string) string {
-	v := styleValue.Render(value)
-	if colorFn != "" {
-		v = colorFn
-	}
-	_ = v
-	// Re-apply based on flag
 	if colorFn != "" {
 		return styleLabel.Render(label) + colorFn + "\n"
 	}
@@ -289,7 +332,6 @@ func row(label, value, colorFn string) string {
 }
 
 func fmtInt(n int64) string {
-	// Add thousands separators
 	s := fmt.Sprintf("%d", n)
 	if len(s) <= 3 {
 		return s
@@ -372,15 +414,15 @@ func renderSparkline(history []int) string {
 func formatDuration(d time.Duration) string {
 	d = d.Round(time.Second)
 	h := int(d.Hours())
-	m := int(d.Minutes()) % 60
-	s := int(d.Seconds()) % 60
+	mi := int(d.Minutes()) % 60
+	sec := int(d.Seconds()) % 60
 	if h > 0 {
-		return fmt.Sprintf("%dh%02dm%02ds", h, m, s)
+		return fmt.Sprintf("%dh%02dm%02ds", h, mi, sec)
 	}
-	if m > 0 {
-		return fmt.Sprintf("%dm%02ds", m, s)
+	if mi > 0 {
+		return fmt.Sprintf("%dm%02ds", mi, sec)
 	}
-	return fmt.Sprintf("%ds", s)
+	return fmt.Sprintf("%ds", sec)
 }
 
 // ── public entry point ────────────────────────────────────────────────────────
