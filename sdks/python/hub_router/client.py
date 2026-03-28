@@ -128,13 +128,64 @@ class OnlineClient:
             f"for request {request_id!r}"
         )
 
+    async def do_sync(
+        self,
+        payload: Any,
+        headers: Optional[dict[str, str]] = None,
+        *,
+        timeout: Optional[float] = None,
+    ) -> tuple[Result | None, str | None]:
+        """
+        Single-request fast path using ``POST /request/sync``.
+
+        Enqueues the request and waits for the result within the same HTTP
+        connection. If the local server responds before the timeout, returns
+        ``(result, None)``. If the timeout elapses, returns ``(None, request_id)``
+        so the caller can continue polling with :meth:`wait_result`.
+
+        :returns: ``(Result, None)`` on fast path, or ``(None, request_id)`` on slow path.
+        :raises QueueFullError: If the queue is at capacity.
+        """
+        t = timeout or self._long_poll_timeout
+        resp = await self._client.post(
+            f"{self._base_url}/request/sync?timeout={t}s",
+            json={"payload": payload, "headers": headers or {}},
+            headers={"X-Online-API-Key": self._api_key},
+        )
+        if resp.status_code == 503:
+            data = resp.json()
+            raise QueueFullError(data.get("message", "queue full"))
+        if resp.status_code == 200:
+            return Result.from_dict(resp.json()), None
+        if resp.status_code == 202:
+            data = resp.json()
+            return None, data["id"]
+        raise HubRouterError(f"unexpected status {resp.status_code}: {resp.text}")
+
     async def do(
         self,
         payload: Any,
         headers: Optional[dict[str, str]] = None,
     ) -> Result:
         """
-        Convenience wrapper: :meth:`submit` + :meth:`wait_result` in one call.
+        Submit a request and wait for its result.
+
+        Tries the single-request fast path (``POST /request/sync``) first.
+        If the local server is busy, transparently falls back to async polling.
+        """
+        result, request_id = await self.do_sync(payload, headers)
+        if result is not None:
+            return result  # fast path — done in one request
+        return await self.wait_result(request_id)  # slow path — keep polling
+
+    async def _do_legacy(
+        self,
+        payload: Any,
+        headers: Optional[dict[str, str]] = None,
+    ) -> Result:
+        """
+        Original two-step path: :meth:`submit` + :meth:`wait_result`.
+        Available if you want to bypass the sync endpoint explicitly.
         """
         request_id = await self.submit(payload, headers)
         return await self.wait_result(request_id)

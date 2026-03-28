@@ -113,13 +113,64 @@ export class OnlineClient {
   }
 
   /**
-   * Convenience wrapper: {@link submit} + {@link waitResult} in one call.
+   * Single-request fast path using `POST /request/sync`.
+   *
+   * Enqueues the request and waits for the result within the same HTTP
+   * connection. Returns `{ result }` when the local server responds before
+   * the timeout, or `{ requestId }` when the local server is slow — the
+   * caller should then call {@link waitResult} with the returned ID.
+   *
+   * @throws {QueueFullError} if the queue is at capacity.
+   */
+  async doSync(
+    payload: unknown,
+    headers: Record<string, string> = {},
+    options?: { timeout?: number }
+  ): Promise<{ result: Result } | { requestId: string }> {
+    const timeoutMs = options?.timeout ?? this.longPollTimeoutMs;
+    const timeoutSec = (timeoutMs / 1000).toFixed(1);
+    const url = `${this.baseUrl}/request/sync?timeout=${timeoutSec}s`;
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Online-API-Key": this.apiKey,
+      },
+      body: JSON.stringify({ payload, headers }),
+      signal: AbortSignal.timeout(timeoutMs + 10_000),
+    });
+
+    if (res.status === 200) {
+      return { result: (await res.json()) as Result };
+    }
+    if (res.status === 202) {
+      const data = (await res.json()) as { id: string };
+      return { requestId: data.id };
+    }
+    if (res.status === 503) {
+      const data = (await res.json()) as { message?: string };
+      throw new QueueFullError(data.message);
+    }
+    throw new HubRouterError(
+      `unexpected status ${res.status}: ${await res.text()}`
+    );
+  }
+
+  /**
+   * Submit a request and wait for its result.
+   *
+   * Tries the single-request fast path ({@link doSync}) first.
+   * If the local server is busy, transparently falls back to async polling.
    */
   async do(
     payload: unknown,
     headers: Record<string, string> = {}
   ): Promise<Result> {
-    const id = await this.submit(payload, headers);
-    return this.waitResult(id);
+    const response = await this.doSync(payload, headers);
+    if ("result" in response) {
+      return response.result; // fast path — done in one request
+    }
+    return this.waitResult(response.requestId); // slow path — keep polling
   }
 }

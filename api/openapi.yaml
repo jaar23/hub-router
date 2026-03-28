@@ -155,6 +155,70 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /request/sync:
+    post:
+      summary: Submit and wait for result (synchronous fast path)
+      description: |
+        Enqueues the request **and** waits for the result within the same HTTP
+        connection — behaving like a normal reverse proxy when the local server
+        is fast.
+
+        **200 OK** — result arrived before the timeout; body is the full Result.
+
+        **202 Accepted** — local server is busy or not running; body is a
+        `SubmitResponse` containing the correlation ID. The client should continue
+        polling `GET /result/{id}` with that ID.
+
+        The `?timeout` query parameter caps the wait (default: `HR_LONGPOLL_TIMEOUT`,
+        typically 30 s). The HTTP `WriteTimeout` on the server is always larger, so
+        the connection is never force-closed mid-wait.
+      security:
+        - OnlineAPIKey: []
+      parameters:
+        - name: timeout
+          in: query
+          description: Maximum wait duration, e.g. "5s", "2s". Capped at server maximum.
+          schema:
+            type: string
+            default: "30s"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubmitRequest"
+      responses:
+        "200":
+          description: Result ready — returned immediately within this request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Result"
+        "202":
+          description: Timeout elapsed — use the returned ID to poll GET /result/{id}
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmitResponse"
+        "400":
+          description: Invalid request body
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Queue is full
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /result/{id}:
     get:
       summary: Long-poll for a result

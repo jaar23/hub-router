@@ -137,11 +137,78 @@ func (c *OnlineClient) WaitResult(ctx context.Context, requestID string) (*model
 	return nil, fmt.Errorf("result not available after %d retries for request %s", c.opts.MaxRetries, requestID)
 }
 
-// Do is a convenience wrapper: Submit + WaitResult in one call.
+// DoSync sends POST /request/sync — a single HTTP request that enqueues and
+// waits for the result within the same connection.
+//
+// Returns:
+//   - (result, "", nil)    — fast path: result arrived before timeout.
+//   - (nil, requestID, nil) — slow path: local server is busy; caller should
+//     call WaitResult(ctx, requestID) to continue polling.
+//   - (nil, "", err)       — request could not be submitted (queue full, auth, etc.).
+func (c *OnlineClient) DoSync(ctx context.Context, payload any, headers map[string]string) (*model.Result, string, error) {
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, "", fmt.Errorf("marshal payload: %w", err)
+	}
+	body := map[string]any{
+		"payload": json.RawMessage(payloadBytes),
+		"headers": headers,
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	timeout := c.opts.LongPollTimeout.String()
+	url := fmt.Sprintf("%s/request/sync?timeout=%s", c.baseURL, timeout)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Online-API-Key", c.apiKey)
+
+	resp, err := c.opts.HTTPClient.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("sync request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		// Fast path: result came back immediately.
+		var result model.Result
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return nil, "", fmt.Errorf("decode sync result: %w", err)
+		}
+		return &result, "", nil
+
+	case http.StatusAccepted:
+		// Slow path: server timed out waiting; continue with async polling.
+		var submitResp model.SubmitResponse
+		if err := json.NewDecoder(resp.Body).Decode(&submitResp); err != nil {
+			return nil, "", fmt.Errorf("decode submit response: %w", err)
+		}
+		return nil, submitResp.ID, nil
+
+	case http.StatusServiceUnavailable:
+		var errResp model.ErrorResponse
+		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		return nil, "", fmt.Errorf("queue full: %s", errResp.Message)
+
+	default:
+		raw, _ := io.ReadAll(resp.Body)
+		return nil, "", fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(raw))
+	}
+}
+
+// Do uses DoSync for a single round-trip when the local server is fast,
+// falling back to WaitResult for slow processors. Transparent to the caller.
 func (c *OnlineClient) Do(ctx context.Context, payload any, headers map[string]string) (*model.Result, error) {
-	id, err := c.Submit(ctx, payload, headers)
+	result, id, err := c.DoSync(ctx, payload, headers)
 	if err != nil {
 		return nil, err
 	}
-	return c.WaitResult(ctx, id)
+	if result != nil {
+		return result, nil // fast path — done in one request
+	}
+	return c.WaitResult(ctx, id) // slow path — keep polling
 }

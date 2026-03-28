@@ -70,6 +70,9 @@ func New(cfg *config.Config, logger *slog.Logger) *Server {
 	mux.Handle("POST /request",
 		lockout.Wrap("X-Online-API-Key", auth.ValidOnlineKey,
 			http.HandlerFunc(onlineH.HandleSubmit)))
+	mux.Handle("POST /request/sync",
+		lockout.Wrap("X-Online-API-Key", auth.ValidOnlineKey,
+			http.HandlerFunc(onlineH.HandleSync)))
 	mux.Handle("GET /result/{id}",
 		lockout.Wrap("X-Online-API-Key", auth.ValidOnlineKey,
 			http.HandlerFunc(onlineH.HandleResult)))
