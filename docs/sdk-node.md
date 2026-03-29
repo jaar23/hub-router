@@ -61,13 +61,31 @@ console.log(result.payload);     // { capital: "Paris" }
 console.log(result.status_code); // 200
 ```
 
-With headers:
+With headers and a routing key:
 
 ```typescript
 const result = await client.do(
   { query: "hello" },
-  { "X-User-Id": "u123", "X-Tenant": "acme" }
+  { "X-User-Id": "u123", "X-Tenant": "acme" },
+  { key: "gpu" }  // route to the "gpu" queue
 );
+```
+
+#### Result helpers
+
+```typescript
+// isError() — true when status_code >= 400 or error is non-empty
+if (result.isError()) {
+  throw result.err();  // returns an Error, or null if no error
+}
+
+// err() — returns an Error describing the failure, or null
+const err = result.err();
+
+// unmarshal<T>() — cast/parse the payload to a typed value
+interface Answer { capital: string }
+const data = result.unmarshal<Answer>();
+console.log(data.capital); // Paris
 ```
 
 ### doRequest — forward an incoming HTTP request
@@ -161,6 +179,7 @@ const worker = new LocalClient(
   "http://hub-router:8080",
   "local-api-key",
   {
+    key: "gpu",         // pull only from the "gpu" queue (default: "" → "default")
     batchSize: 20,      // requests per pull (default: 10)
     pollInterval: 500,  // ms to sleep when queue empty (default: 1000)
     workers: 4,         // concurrent processor callbacks (default: 1)
@@ -199,6 +218,7 @@ worker.stop(); // drains in-flight requests, then run() resolves
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `key` | `""` (→ `"default"`) | Pull only from the named queue. |
 | `batchSize` | `10` | Requests fetched per `GET /queue/pull`. |
 | `pollInterval` | `1000` | Milliseconds to sleep when queue is empty. |
 | `workers` | `1` | Max concurrent processor calls (integer semaphore). |
@@ -224,21 +244,35 @@ await worker.pushResult({
 ```typescript
 interface QueuedRequest {
   id: string;                          // UUIDv7 correlation ID
+  key?: string;                        // routing key (absent = "default")
   payload: unknown;                    // JSON from online server
   headers: Record<string, string>;     // forwarded headers
   enqueued_at: string;                 // ISO 8601
   expires_at: string;                  // ISO 8601
 }
 
-interface Result {
+// Result is a class — use new Result(data) or receive from client.do()
+class Result {
   request_id: string;
   payload: unknown;                    // JSON result from local server
   status_code: number;
   error?: string;
   completed_at?: string;               // ISO 8601
+
+  isError(): boolean;                  // true if status_code >= 400 or error non-empty
+  err(): Error | null;                 // Error when isError(), else null
+  unmarshal<T>(): T;                   // cast payload to T (already JSON-parsed)
 }
 
-type ProcessorFn = (req: QueuedRequest) => Promise<Result>;
+interface ResultData {                 // plain object shape accepted by pushResult()
+  request_id: string;
+  payload: unknown;
+  status_code: number;
+  error?: string;
+  completed_at?: string;
+}
+
+type ProcessorFn = (req: QueuedRequest) => Promise<ResultData>;
 ```
 
 ---

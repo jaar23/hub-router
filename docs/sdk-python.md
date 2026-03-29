@@ -51,13 +51,36 @@ print(result.payload)   # {"capital": "Paris"}
 print(result.status_code)  # 200
 ```
 
-With headers:
+With headers and a routing key:
 
 ```python
 result = await client.do(
     payload={"query": "hello"},
     headers={"X-User-Id": "u123", "X-Tenant": "acme"},
+    key="gpu",  # route to the "gpu" queue
 )
+```
+
+#### Result helpers
+
+```python
+# is_error() — True when status_code >= 400 or error is non-empty
+if result.is_error():
+    raise result.err()  # returns an Exception, or None if no error
+
+# err() — returns an Exception describing the failure, or None
+exc = result.err()
+
+# unmarshal() — return the payload as a Python object (already JSON-decoded)
+data = result.unmarshal()
+
+# unmarshal(cls) — instantiate a dataclass or namedtuple from the payload dict
+@dataclass
+class Answer:
+    capital: str
+
+answer = result.unmarshal(Answer)
+print(answer.capital)  # Paris
 ```
 
 ### do_request — forward an incoming HTTP request
@@ -138,6 +161,7 @@ from hub_router import LocalClient
 worker = LocalClient(
     "http://hub-router:8080",
     api_key="local-api-key",
+    key="gpu",            # pull only from the "gpu" queue (default: "" → "default")
     batch_size=20,        # requests per pull (default: 10)
     poll_interval=0.5,   # seconds to sleep when queue empty (default: 1.0)
     workers=4,            # concurrent processor coroutines (default: 1)
@@ -187,6 +211,7 @@ worker.stop()  # signals the loop to drain and exit
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
+| `key` | `""` (→ `"default"`) | Pull only from the named queue. |
 | `batch_size` | `10` | Requests fetched per `GET /queue/pull`. |
 | `poll_interval` | `1.0` | Seconds to sleep when queue is empty. |
 | `workers` | `1` | Max concurrent `ProcessorFunc` coroutines (asyncio semaphore). |
@@ -216,6 +241,7 @@ await worker.push_result(Result(
 class QueuedRequest:
     id: str                           # UUIDv7 correlation ID
     payload: Any                      # JSON-decoded payload from online server
+    key: str                          # routing key (empty = "default")
     headers: dict[str, str]           # forwarded headers
     enqueued_at: datetime | None
     expires_at: datetime | None
@@ -231,6 +257,15 @@ class Result:
     status_code: int = 200
     error: str = ""
     completed_at: datetime | None = None  # auto-set if omitted
+
+    def is_error(self) -> bool: ...
+    """True when status_code >= 400 or error is non-empty."""
+
+    def err(self) -> Exception | None: ...
+    """Returns an Exception if is_error(), else None."""
+
+    def unmarshal(self, cls=None) -> Any: ...
+    """Return the decoded payload. If cls is given, instantiate it with payload dict as kwargs."""
 ```
 
 ---

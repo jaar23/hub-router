@@ -78,9 +78,24 @@ cmd/hub-router/main.go
     ├── handler/online.go              ← POST /request, POST /request/sync, GET /result/{id}
     └── handler/local.go               ← GET /queue/pull, POST /queue/result
         │
+        ├── internal/queue/keyed.go    ← KeyedQueue: one MemoryQueue per routing key
         ├── internal/queue/memory.go   ← buffered-channel FIFO queue with TTL
         └── internal/store/memory.go   ← mutex-protected result store, long-poll channels
 ```
+
+---
+
+## Key-Based Routing
+
+`KeyedQueue` (in `internal/queue/keyed.go`) wraps a map of `string → *MemoryQueue`. Each routing key gets its own independent FIFO channel with the same `maxSize` cap.
+
+- The `"default"` key queue is pre-created at startup so it is always present in `/debug/stats`.
+- Additional per-key queues are created on the first `Enqueue` call for that key (double-checked locking).
+- `Enqueue(ctx, key, req)` and `Dequeue(ctx, key, n)` normalise an empty key to `"default"`.
+- `StatsAll()` returns a `map[string]QueueStats` snapshot — one entry per active key.
+- Workers isolate their work by passing `?key=K` to `GET /queue/pull`; they only receive requests enqueued under that key.
+
+This design means that a spike in `"gpu"` requests never causes HOL-blocking for `"cpu"` workers, and each key's depth, throughput, and drop counters are tracked independently.
 
 ---
 
@@ -88,17 +103,18 @@ cmd/hub-router/main.go
 
 ### Enqueue phase (online side)
 1. Middleware chain validates the request (auth, rate limit, body size).
-2. Handler parses JSON body into `SubmitRequest{payload, headers}`.
+2. Handler parses JSON body into `SubmitRequest{payload, headers, key}`.
 3. A **UUIDv7** correlation ID is generated (time-sortable, globally unique).
 4. A `QueuedRequest` is built with `EnqueuedAt = now`, `ExpiresAt = now + HR_REQUEST_TTL`.
 5. For sync requests: `store.RegisterPending(id)` is called first.
-6. `queue.Enqueue(req)` places the request at the tail of the buffered channel. If the channel is full, `503 QUEUE_FULL` is returned immediately.
+6. `queue.Enqueue(ctx, key, req)` routes the request to the per-key `MemoryQueue` (empty key → `"default"`). If the channel is full, `503 QUEUE_FULL` is returned immediately.
 
 ### Poll phase (local side)
-1. The local server calls `GET /queue/pull?batch=N` in a tight loop.
-2. The handler drains up to `N` items from the channel head in a non-blocking loop.
-3. Expired items (where `time.Now() > ExpiresAt`) are silently discarded during dequeue.
-4. Remaining items are returned as a JSON array.
+1. The local server calls `GET /queue/pull?batch=N&key=K` in a tight loop.
+2. The `key` query parameter selects the per-key queue (empty or absent → `"default"`).
+3. The handler drains up to `N` items from that queue's channel in a non-blocking loop.
+4. Expired items (where `time.Now() > ExpiresAt`) are silently discarded during dequeue.
+5. Remaining items are returned as a JSON array.
 
 ### Result phase (local → online)
 1. Local server posts `POST /queue/result` with the `Result` JSON.
@@ -126,6 +142,7 @@ The double-check in step 5 handles the race where `Put` runs between steps 1 and
 
 | Component | Thread-safety mechanism |
 |-----------|------------------------|
+| `KeyedQueue` | `sync.RWMutex` guards the key→queue map; per-key queues created with double-checked locking |
 | `MemoryQueue` | Buffered `chan *QueuedRequest` — channel operations are inherently safe |
 | `MemoryStore` | `sync.RWMutex` — short critical sections; waiters registered under lock |
 | `RateLimiter` | `sync.Mutex` per IP bucket; lazy cleanup goroutine |

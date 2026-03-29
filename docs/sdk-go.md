@@ -59,10 +59,22 @@ if err != nil {
     log.Printf("error: %v", err)
     return
 }
-// result.Payload is json.RawMessage — unmarshal to your type
+
+// Check for application-level errors
+if result.IsError() {
+    log.Fatal(result.Err())
+}
+
+// Unmarshal the payload into a typed struct
 var answer struct{ Capital string }
-json.Unmarshal(result.Payload, &answer)
+_ = result.Unmarshal(&answer)
 fmt.Println(answer.Capital) // Paris
+```
+
+Route to a named queue with `WithKey`:
+
+```go
+result, err := client.Do(ctx, payload, nil, hubrouter.WithKey("gpu"))
 ```
 
 ### DoRequest — forward an incoming HTTP request
@@ -131,6 +143,7 @@ Use on the **local processing server** to pull work and push results back.
 worker := hubrouter.NewLocalClient(
     "http://hub-router:8080",
     "local-api-key",
+    hubrouter.WithLocalKey("gpu"),          // pull only from the "gpu" queue
     hubrouter.WithBatchSize(20),
     hubrouter.WithWorkers(4),
     hubrouter.WithPollInterval(500 * time.Millisecond),
@@ -177,6 +190,7 @@ err := worker.Run(ctx, func(ctx context.Context, req *hubrouter.QueuedRequest) (
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `WithLocalKey(k)` | `""` (→ `"default"`) | Pull only from the named queue. |
 | `WithBatchSize(n)` | `10` | Requests fetched per `GET /queue/pull` call. |
 | `WithWorkers(n)` | `1` | Max concurrent `ProcessorFunc` goroutines. |
 | `WithPollInterval(d)` | `1s` | Sleep duration when the queue is empty. |
@@ -205,6 +219,7 @@ err = worker.PushResult(ctx, &hubrouter.Result{
 ```go
 type QueuedRequest struct {
     ID         string            // UUIDv7 correlation ID
+    Key        string            // routing key (empty = "default")
     Payload    json.RawMessage   // opaque JSON from online server
     Headers    map[string]string // forwarded headers
     EnqueuedAt time.Time
@@ -221,6 +236,36 @@ type Result struct {
     StatusCode  int             // 200 = success, 500 = error, etc.
     Error       string          // non-empty on failure
     CompletedAt time.Time       // auto-set by SDK if zero
+}
+```
+
+### Result helper methods
+
+```go
+// IsError returns true when StatusCode >= 400 or Error is non-empty.
+func (r *Result) IsError() bool
+
+// Err returns a non-nil error when IsError() is true, nil otherwise.
+func (r *Result) Err() error
+
+// Unmarshal JSON-decodes the Payload into v.
+func (r *Result) Unmarshal(v any) error
+```
+
+**Usage:**
+
+```go
+result, err := client.Do(ctx, payload, nil, hubrouter.WithKey("gpu"))
+if err != nil {
+    return err  // network / hub-router error
+}
+if result.IsError() {
+    return result.Err()  // application-level error from local server
+}
+
+var out MyOutput
+if err := result.Unmarshal(&out); err != nil {
+    return fmt.Errorf("decode result: %w", err)
 }
 ```
 

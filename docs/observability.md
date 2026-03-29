@@ -40,12 +40,12 @@ The TUI reads the same environment variables as the server — no extra configur
 ```
 ╭─ hub-router ────────────────────────── uptime: 1h23m45s ─╮
 │                                                            │
-│  ┌── QUEUE ──────────────────┐  ┌── STORE ─────────────┐  │
-│  │ depth       42 / 10,000   │  │ results          7    │  │
-│  │ enqueued    1,234  total  │  │ waiters         12    │  │
-│  │ dequeued    1,190  total  │  └──────────────────────┘  │
-│  │ expired         3  total  │                            │
-│  │ dropped         0  total  │  ┌── SECURITY ──────────┐  │
+│  ┌── QUEUES ─────────────────┐  ┌── STORE ─────────────┐  │
+│  │ [default]  3 / 10,000    │  │ results          7    │  │
+│  │    enq: 800  deq: 790    │  │ waiters         12    │  │
+│  │ [gpu]  2 / 10,000        │  └──────────────────────┘  │
+│  │    enq: 434  deq: 400    │                            │
+│  │    exp: 1                │  ┌── SECURITY ──────────┐  │
 │  └───────────────────────────┘  │ rate limiting   on    │  │
 │                                 │ tracked IPs     15    │  │
 │  ┌── THROUGHPUT ─────────────┐  │ throttled IPs    2    │  │
@@ -58,10 +58,11 @@ The TUI reads the same environment variables as the server — no extra configur
 
 ### Panel guide
 
-**QUEUE**
-- `depth` — current pending requests (coloured: green < 50%, yellow < 80%, red ≥ 80% of capacity)
-- `enqueued` / `dequeued` / `expired` / `dropped` — cumulative counters since server start
-- `expired` and `dropped` are highlighted in yellow when non-zero
+**QUEUES**
+- One row per active routing key; `"default"` is always shown first, then alphabetical order.
+- Each row shows `[key]  depth / capacity` (coloured: green < 50%, yellow < 80%, red ≥ 80%).
+- `enq` / `deq` — cumulative enqueued / dequeued counters per key since server start.
+- `exp` / `drop` rows appear only when non-zero (highlighted in yellow).
 
 **THROUGHPUT**
 - Sparkline of queue depth over the last 30 seconds (`▁` = low, `█` = peak)
@@ -100,9 +101,13 @@ Full response schema documented in [API Reference](api-reference.md#get-debugsta
 ### Alerting examples
 
 ```bash
-# Alert if queue depth > 5000
-depth=$(curl -s http://hub:8080/debug/stats | jq .queue.depth)
-[ "$depth" -gt 5000 ] && alert "queue depth critical: $depth"
+# Alert if the default queue depth > 5000
+depth=$(curl -s http://hub:8080/debug/stats | jq '.queues.default.depth')
+[ "$depth" -gt 5000 ] && alert "default queue depth critical: $depth"
+
+# Alert if the total depth across all queues > 8000
+total=$(curl -s http://hub:8080/debug/stats | jq '[.queues[].depth] | add')
+[ "$total" -gt 8000 ] && alert "total queue depth critical: $total"
 
 # Alert if any IPs are locked out
 locked=$(curl -s http://hub:8080/debug/stats | jq .security.locked_ips)
