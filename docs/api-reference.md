@@ -34,7 +34,8 @@ Enqueue a request and return immediately with a correlation ID. Use this when th
 ```json
 {
   "payload": <any JSON>,
-  "headers": { "X-User-Id": "u123", "Content-Type": "application/json" }
+  "headers": { "X-User-Id": "u123", "Content-Type": "application/json" },
+  "key": "gpu"
 }
 ```
 
@@ -42,6 +43,7 @@ Enqueue a request and return immediately with a correlation ID. Use this when th
 |-------|------|----------|-------------|
 | `payload` | any JSON | yes | Opaque data forwarded unchanged to the local server. |
 | `headers` | object | no | Key-value metadata forwarded with the request. Useful for passing auth or routing context. |
+| `key` | string | no | Routing key for key-based routing. Requests are placed in the named queue. Omit or set to `""` to use the `"default"` queue. |
 
 **Responses:**
 
@@ -82,7 +84,7 @@ Enqueue a request and wait for the result within the same HTTP connection. When 
 |-----------|------|---------|-------------|
 | `timeout` | string | `HR_LONGPOLL_TIMEOUT` | Maximum wait duration, e.g. `5s`, `30s`. Capped at server maximum. |
 
-**Request body:** Same as `POST /request`.
+**Request body:** Same as `POST /request` (including the optional `key` field).
 
 **Responses:**
 
@@ -198,6 +200,7 @@ The local server should call this in a tight loop. When the response is empty, s
 | Parameter | Type | Default | Max | Description |
 |-----------|------|---------|-----|-------------|
 | `batch` | integer | `HR_MAX_BATCH_SIZE` | `HR_MAX_BATCH_SIZE` | Number of requests to return. |
+| `key` | string | `""` (→ `"default"`) | — | Pull only from the named queue. Omit or pass `""` to pull from the `"default"` queue. |
 
 **Responses:**
 
@@ -219,6 +222,7 @@ curl -s "http://localhost:8080/queue/pull?batch=10" \
   "requests": [
     {
       "id": "01960000-0000-7000-8000-000000000001",
+      "key": "gpu",
       "payload": {"query": "hello world"},
       "headers": {"X-User-Id": "u123"},
       "enqueued_at": "2026-03-28T12:00:00.000Z",
@@ -299,13 +303,23 @@ Returns a detailed real-time snapshot of all observable hub-router state. Used b
 ```json
 {
   "uptime_seconds": 3600,
-  "queue": {
-    "depth": 5,
-    "capacity": 10000,
-    "enqueued_total": 1234,
-    "dequeued_total": 1190,
-    "expired_total": 3,
-    "dropped_total": 0
+  "queues": {
+    "default": {
+      "depth": 3,
+      "capacity": 10000,
+      "enqueued_total": 800,
+      "dequeued_total": 790,
+      "expired_total": 2,
+      "dropped_total": 0
+    },
+    "gpu": {
+      "depth": 2,
+      "capacity": 10000,
+      "enqueued_total": 434,
+      "dequeued_total": 400,
+      "expired_total": 1,
+      "dropped_total": 0
+    }
   },
   "store": {
     "results": 12,
@@ -320,6 +334,8 @@ Returns a detailed real-time snapshot of all observable hub-router state. Used b
   }
 }
 ```
+
+`queues` is a map keyed by routing key. The `"default"` key is always present. Per-key queues are created on first use.
 
 All counters (`enqueued_total`, `dequeued_total`, etc.) are cumulative since server start. `depth` and `active_waiters` are instantaneous values.
 
@@ -407,6 +423,7 @@ Returned inside `PullResponse`.
 ```json
 {
   "id": "01960000-0000-7000-8000-000000000001",
+  "key": "gpu",
   "payload": {"query": "hello world"},
   "headers": {"X-User-Id": "u123", "Content-Type": "application/json"},
   "enqueued_at": "2026-03-28T12:00:00.000Z",
@@ -417,6 +434,7 @@ Returned inside `PullResponse`.
 | Field | Type | Description |
 |-------|------|-------------|
 | `id` | string | UUIDv7 — use as `request_id` when pushing result. |
+| `key` | string | Routing key this request was enqueued with. Omitted when `"default"`. |
 | `payload` | any JSON | The original payload from the online server. |
 | `headers` | object | Headers forwarded by the online server (or from `doRequest`). |
 | `enqueued_at` | datetime | When the request entered the queue. |

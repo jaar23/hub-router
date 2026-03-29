@@ -24,6 +24,7 @@ Or using the **sync fast path** (single round-trip when local is fast):
 ## Features
 
 - **Two delivery modes** — async queue+poll, or sync fast-path that returns immediately like a normal HTTP proxy
+- **Key-based routing** — route requests to isolated per-key queues; different worker types pull only their own work
 - **Zero external dependencies** — in-memory queue and result store; no Redis, no Kafka
 - **API key auth** — separate key sets for online and local servers, timing-safe comparison
 - **Brute-force protection** — per-IP rate limiting (token bucket) and auth-failure lockout
@@ -131,6 +132,48 @@ worker.run(async (req) => {
     return { request_id: req.id, payload: output, status_code: 200 };
 });
 ```
+
+---
+
+## Key-Based Routing
+
+By default all requests go to the `"default"` queue. Pass an optional `key` to route different request types to isolated queues — each key has its own FIFO channel and independent counters. Workers pull only from their assigned queue.
+
+**Online server** — tag each request with a key:
+
+```go
+// Go SDK
+result, err := client.Do(ctx, payload, nil, hubrouter.WithKey("gpu"))
+```
+
+```python
+# Python SDK
+result = await client.do(payload, key="gpu")
+```
+
+```typescript
+// Node.js SDK
+const result = await client.do(payload, {}, { key: "gpu" });
+```
+
+**Local worker** — pull only from the matching queue:
+
+```go
+// Go SDK
+worker := hubrouter.NewLocalClient(hubURL, localKey, hubrouter.WithLocalKey("gpu"))
+```
+
+```python
+# Python SDK
+worker = LocalClient(hub_url, api_key=local_key, key="gpu")
+```
+
+```typescript
+// Node.js SDK
+const worker = new LocalClient(hubURL, localKey, { key: "gpu" });
+```
+
+Requests without a key (or `key: ""`) fall back to the `"default"` queue.
 
 ---
 
